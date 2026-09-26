@@ -390,6 +390,42 @@ WSOLA 变速不变调：按时长倍率 `1/speed` 改变 WAV 时长而保持原�
 错误：`422` —— Base64 非法、WAV 不合规、频段数量不在 1～6、任一频段参数或
 `ceiling_dbtp` 越界或为非有限值（NaN/±Inf）。
 
+### `POST /v1/onsets`
+
+谱通量瞬态检测：返回供剪辑定位的瞬态起点（onset）列表，**不修改音频**。
+输入 WAV 校验与 `/v1/normalize` 相同（48 kHz / 16-bit PCM /
+单或双声道 / 1–10 s）。
+
+请求体（JSON）：
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `wav_base64` | string | 必填 | Base64 编码的 WAV：48 kHz、16-bit PCM、单/双声道、1–10 s |
+| `min_relative_flux` | number | 0 ~ 1，默认 0.1 | 候选通量下限，为全片最大通量的倍数 |
+
+响应（200）：
+
+| 字段 | 说明 |
+|---|---|
+| `onsets` | 检测到的瞬态起点，按时间升序；全静音时为空数组 |
+| `onsets[].frame_index` | 窗口中心采样索引，钳到 `[0, n-1]` |
+| `onsets[].strength` | 该点通量除以全片最大通量（0, 1] |
+
+检测规则：
+
+1. 各声道用居中 1024 点 Hann 窗、256 帧步长作实数 FFT（信号两端各补零
+   512 采样，第 k 帧中心对准采样 `k*256`）；逐帧将本帧与前一帧各频点幅度
+   的正差求和作为通量（首帧与全零谱比较），双声道逐帧取较大值；
+2. 候选帧须为**严格局部峰**（平台峰取最早帧），通量严格高于前后各 20 帧
+   通量的中位数加 3 倍 MAD，且达到全片最大通量的 `min_relative_flux` 倍；
+3. 候选按通量降序、同值按时间升序，依次选取与所有已选点至少相隔
+   80 ms（3840 采样 = 15 帧）者；
+4. 结果按时间升序返回，`strength = 通量 / 全片最大通量`；
+   全静音（最大通量为 0）返回空数组。
+
+错误：`422` —— Base64 非法、WAV 不合规、`min_relative_flux` 越界或为
+非有限值（NaN/±Inf）。
+
 ### 处理流程
 
 1. 用 `pyloudnorm`（BS.1770 K 加权）测输入综合响度；
@@ -718,6 +754,37 @@ with open("eq.wav", "wb") as f:
 EOF
 ```
 
+```bash
+# 生成 2 秒「静音 + 三个脉冲咔哒声」的 WAV，检测瞬态起点用于剪辑定位
+python3 - <<'EOF'
+import base64, io, json, wave, urllib.request
+import numpy as np
+
+rate = 48000
+pcm = np.zeros(rate * 2, dtype="<i2")
+for pos in (24000, 48000, 72000):      # 0.5 s、1.0 s、1.5 s 处各一个咔哒声
+    pcm[pos] = 26214
+buf = io.BytesIO()
+with wave.open(buf, "wb") as wf:
+    wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+    wf.writeframes(pcm.tobytes())
+
+req = urllib.request.Request(
+    "http://localhost:8000/v1/onsets",
+    data=json.dumps({
+        "wav_base64": base64.b64encode(buf.getvalue()).decode(),
+        "min_relative_flux": 0.1,       # 可省略，默认 0.1
+    }).encode(),
+    headers={"Content-Type": "application/json"},
+)
+resp = json.load(urllib.request.urlopen(req))
+print(resp["onsets"])
+# [{'frame_index': 23808, 'strength': 0.92388},
+#  {'frame_index': 47872, 'strength': 1.0},
+#  {'frame_index': 71936, 'strength': 0.92388}]
+EOF
+```
+
 ## 项目结构
 
 ```
@@ -732,6 +799,7 @@ app/
   time_stretch.py  # WSOLA 变速不变调：40 ms 片段 / 20 ms 步长 / ±240 帧 NCC 搜索
   align_stereo.py  # 双声道对齐：校准区间去均值 NCC 偏移估计、右轨平移/反相
   eq.py            # 参量均衡：RBJ peaking biquad 串联、真峰值上限与后置增益回退
+  onsets.py        # 谱通量瞬态检测：居中 Hann 窗 STFT、自适应阈值与 80 ms 选点
 tests/
   test_normalize.py
   test_compare_gain.py
@@ -742,6 +810,7 @@ tests/
   test_time_stretch.py
   test_align_stereo.py
   test_eq.py
+  test_onsets.py
 Dockerfile
 docker-compose.yml
 requirements.txt        # 运行依赖（已锁定版本）
