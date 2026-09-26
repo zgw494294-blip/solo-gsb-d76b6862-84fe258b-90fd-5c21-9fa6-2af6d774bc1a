@@ -19,6 +19,7 @@ from .cut_splice import CueInterval, cut_splice_wav
 from .denoise import denoise_wav
 from .eq import EqBand, eq_wav
 from .loudness import SAMPLE_RATE, AudioValidationError, normalize_wav
+from .onsets import detect_onsets
 from .repair_gaps import RepairMethod, repair_gaps_wav
 from .time_stretch import time_stretch_wav
 
@@ -380,6 +381,37 @@ class EqResponse(BaseModel):
     )
 
 
+class OnsetsRequest(BaseModel):
+    wav_base64: str = Field(
+        ...,
+        min_length=1,
+        description="Base64-encoded WAV: 48 kHz, 16-bit PCM, mono/stereo, 1-10 s",
+    )
+    min_relative_flux: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        description="Minimum onset flux as a fraction of the clip-wide "
+        "maximum flux",
+    )
+
+
+class OnsetModel(BaseModel):
+    frame_index: int = Field(
+        ..., description="Window-centre sample index, clamped to the audio bounds"
+    )
+    strength: float = Field(
+        ..., description="Spectral flux as a fraction of the clip-wide maximum"
+    )
+
+
+class OnsetsResponse(BaseModel):
+    onsets: list[OnsetModel] = Field(
+        ..., description="Detected transient onsets in ascending time order"
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -627,4 +659,29 @@ def eq(request: EqRequest) -> EqResponse:
         input_true_peak_dbtp=round(result.input_true_peak_dbtp, 3),
         output_true_peak_dbtp=round(result.output_true_peak_dbtp, 3),
         post_gain_db=round(result.post_gain_db, 3),
+    )
+
+
+@app.post("/v1/onsets", response_model=OnsetsResponse)
+def onsets(request: OnsetsRequest) -> OnsetsResponse:
+    try:
+        wav_bytes = base64.b64decode(request.wav_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid Base64 payload: {exc}"
+        ) from exc
+
+    try:
+        result = detect_onsets(wav_bytes, request.min_relative_flux)
+    except AudioValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return OnsetsResponse(
+        onsets=[
+            OnsetModel(
+                frame_index=onset.frame_index,
+                strength=round(onset.strength, 6),
+            )
+            for onset in result.onsets
+        ]
     )
